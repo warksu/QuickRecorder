@@ -35,7 +35,7 @@ struct SettingsView: View {
             }
             .listStyle(.sidebar)
             .padding(.top, 9)
-        }.frame(width: 600, height: 512)
+        }.frame(width: 600, height: 552)
     }
 }
 
@@ -71,9 +71,11 @@ struct GeneralView: View {
                 SToggle("Show QuickRecorder on Menu Bar", isOn: $showMenubar)
                     //.disabled(!showOnDock)
             }
-            SGroupBox(label: "Update") { UpdaterSettingsView(updater: updaterController.updater) }
+            if !isAudioExperiment {
+                SGroupBox(label: "Update") { UpdaterSettingsView(updater: updaterController.updater) }
+            }
             VStack(spacing: 8) {
-                CheckForUpdatesView(updater: updaterController.updater)
+                if !isAudioExperiment { CheckForUpdatesView(updater: updaterController.updater) }
                 if let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String {
                     Text("QuickRecorder v\(appVersion)")
                         .font(.subheadline)
@@ -165,8 +167,18 @@ struct OutputView: View {
     @AppStorage("remuxAudio")       private var remuxAudio: Bool = true
     @AppStorage("enableAEC")        private var enableAEC: Bool = false
     @AppStorage("AECLevel")         private var AECLevel: String = "mid"
+    @AppStorage("useScreenCaptureKitMicrophone") private var useScreenCaptureKitMicrophone: Bool = supportsScreenCaptureKitMicrophone
+    @AppStorage("micDevice")        private var micDevice: String = "default"
     @AppStorage("withAlpha")        private var withAlpha: Bool = false
     @AppStorage("saveDirectory")    private var saveDirectory: String?
+
+    private var usesNativeMicrophone: Bool {
+        supportsScreenCaptureKitMicrophone && useScreenCaptureKitMicrophone
+    }
+
+    private var effectiveAEC: Binding<Bool> {
+        Binding(get: { !usesNativeMicrophone && micDevice == "default" && enableAEC }, set: { enableAEC = $0 })
+    }
 
     var body: some View {
         SForm(spacing: 30) {
@@ -193,14 +205,24 @@ struct OutputView: View {
                     SToggle("Record Microphone to Main Track", isOn: $remuxAudio)
                     SDivider()
                 }
-                SToggle("Enable Acoustic Echo Cancellation", isOn: $enableAEC)
+                if supportsScreenCaptureKitMicrophone {
+                    SPicker("Microphone Capture", selection: $useScreenCaptureKitMicrophone,
+                            tips: "ScreenCaptureKit does not apply echo cancellation. Legacy AEC requires the default microphone.") {
+                        Text("Legacy").tag(false)
+                        Text("ScreenCaptureKit").tag(true)
+                    }.disabled(SCContext.stream != nil)
+                    SDivider()
+                }
+                SToggle("Enable Acoustic Echo Cancellation", isOn: effectiveAEC,
+                        tips: "ScreenCaptureKit does not apply echo cancellation. Legacy AEC requires the default microphone.")
+                    .disabled(usesNativeMicrophone || micDevice != "default" || SCContext.stream != nil)
                 if #available(macOS 14, *) {
                     SDivider()
                     SPicker("Audio Ducking Level", selection: $AECLevel) {
                         Text("Min").tag("min")
                         Text("Mid").tag("mid")
                         Text("Max").tag("max")
-                    }.disabled(!enableAEC)
+                    }.disabled(usesNativeMicrophone || micDevice != "default" || !enableAEC || SCContext.stream != nil)
                 }
             }
             SGroupBox(label: "Video") {

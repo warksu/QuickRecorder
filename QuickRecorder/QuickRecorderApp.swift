@@ -19,6 +19,13 @@ import Sparkle
 let isMacOS12 = ProcessInfo.processInfo.operatingSystemVersion.majorVersion == 12
 let isMacOS14 = ProcessInfo.processInfo.operatingSystemVersion.majorVersion == 14
 let isMacOS15 = ProcessInfo.processInfo.operatingSystemVersion.majorVersion == 15
+let supportsScreenCaptureKitMicrophone: Bool = {
+#if compiler(>=6.0)
+    if #available(macOS 15.0, *) { return true }
+#endif
+    return false
+}()
+let isAudioExperiment = (Bundle.main.bundleIdentifier ?? "").hasSuffix(".AudioExperiment")
 var scPerm = false
 let fd = FileManager.default
 let ud = UserDefaults.standard
@@ -45,7 +52,7 @@ struct QuickRecorderApp: App {
     init() {
         // If you want to start the updater manually, pass false to startingUpdater and call .startUpdater() later
         // This is where you can also pass an updater delegate if you need one
-        updaterController = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+        updaterController = SPUStandardUpdaterController(startingUpdater: !isAudioExperiment, updaterDelegate: nil, userDriverDelegate: nil)
     }
     
     var body: some Scene {
@@ -88,7 +95,7 @@ struct QuickRecorderApp: App {
         .commands {
             CommandGroup(replacing: .newItem) {}
             CommandGroup(after: .appInfo) {
-                CheckForUpdatesView(updater: updaterController.updater)
+                if !isAudioExperiment { CheckForUpdatesView(updater: updaterController.updater) }
             }
         }
     }
@@ -119,6 +126,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, SCStreamDelegate, SCStreamOu
     @AppStorage("enableAEC")        var enableAEC: Bool = false
     @AppStorage("recordMic")        var recordMic: Bool = false
     @AppStorage("micDevice")        var micDevice: String = "default"
+    @AppStorage("useScreenCaptureKitMicrophone") var useScreenCaptureKitMicrophone: Bool = supportsScreenCaptureKitMicrophone
     @AppStorage("remuxAudio")       var remuxAudio: Bool = true
     @AppStorage("recordWinSound")   var recordWinSound: Bool = true
     @AppStorage("recordHDR")        var recordHDR: Bool = false
@@ -231,6 +239,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, SCStreamDelegate, SCStreamOu
                 "saveDirectory": userDesktop as NSString,
                 "showMouse": true,
                 "recordMic": false,
+                "useScreenCaptureKitMicrophone": supportsScreenCaptureKitMicrophone,
                 "remuxAudio": isMacOS12 ? false : true,
                 "recordWinSound": isMacOS12 ? false : true,
                 "trimAfterRecord": false,

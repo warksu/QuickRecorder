@@ -27,10 +27,17 @@ class SCContext {
     static var isMagnifierEnabled = false
     static var saveFrame = false
     static var isPaused = false
-    static var isResume = false
     static var isSkipFrame = false
     static var lastPTS: CMTime?
-    static var timeOffset = CMTimeMake(value: 0, timescale: 0)
+    static var timeOffset: CMTime = .zero
+    static let recordingQueue = DispatchQueue(label: "com.lihaoyun6.QuickRecorder.recording")
+    static var timeline = RecordingTimeline()
+    static var usesScreenCaptureKitMicrophone = false
+    static var legacyMicrophoneStarted = false
+    static var legacyAECStarted = false
+    static var legacyUsesAudioEngine = false
+    static var recordedMicrophone = false
+    static var microphoneSampleCount = 0
     static var screenArea: NSRect?
     static let audioEngine = AVAudioEngine()
     static let AECEngine = AECAudioStream(sampleRate: 48000)
@@ -318,11 +325,17 @@ class SCContext {
     }
     
     static func pauseRecording() {
-        isPaused.toggle()
+        if !isPaused { timePassed = Date.now.timeIntervalSince(startTime ?? Date.now) }
+        recordingQueue.sync {
+            let now = CMClockGetTime(CMClockGetHostTimeClock())
+            if timeline.isPaused { timeline.resume(at: now) }
+            else { timeline.pause(at: now) }
+            isPaused = timeline.isPaused
+            timeOffset = timeline.offset
+        }
         PopoverState.shared.isPaused = isPaused
         if !isPaused {
-            isResume = true
-            startTime = Date.now.addingTimeInterval(-1) - SCContext.timePassed
+            startTime = Date.now - timePassed
         }
     }
     
@@ -339,16 +352,15 @@ class SCContext {
 
         if let w = NSApp.windows.first(where:  { $0.title == "Area Overlayer".local }) { w.close() }
         
-        if stream != nil { stream.stopCapture() }
-        stream = nil
-        if ud.bool(forKey: "recordMic") {
-            micInput.markAsFinished()
-            AudioRecorder.shared.stop()
-            audioEngine.inputNode.removeTap(onBus: 0)
-            audioEngine.stop()
-            //DispatchQueue.global().async { try? audioEngine.inputNode.setVoiceProcessingEnabled(false) }
-            if ud.bool(forKey: "enableAEC") { try? AECEngine.stopAudioUnit() }
+        let activeStream = recordingQueue.sync { () -> SCStream? in
+            let activeStream = stream
+            stream = nil
+            return activeStream
         }
+        activeStream?.stopCapture()
+        if recordedMicrophone { micInput?.markAsFinished() }
+        stopMicrophoneRecording()
+        if recordedMicrophone { print("Microphone buffers written: \(microphoneSampleCount)") }
         if streamType != .systemaudio {
             let dispatchGroup = DispatchGroup()
             dispatchGroup.enter()
@@ -385,7 +397,12 @@ class SCContext {
             }
             dispatchGroup.wait()
         } else {
-            if ud.bool(forKey: "recordMic") { vW.finishWriting {} }
+            if recordedMicrophone {
+                let dispatchGroup = DispatchGroup()
+                dispatchGroup.enter()
+                vW.finishWriting { dispatchGroup.leave() }
+                dispatchGroup.wait()
+            }
         }
         
         DispatchQueue.main.async {
@@ -447,6 +464,7 @@ class SCContext {
         }
         
         isPaused = false
+        PopoverState.shared.isPaused = false
         hideMousePointer = false
         window = nil
         screen = nil
@@ -473,7 +491,20 @@ class SCContext {
         }
         
         streamType = nil
+        usesScreenCaptureKitMicrophone = false
         firstFrame = nil
+    }
+
+    static func stopMicrophoneRecording() {
+        guard legacyMicrophoneStarted else { return }
+        if legacyAECStarted { try? AECEngine.stopAudioUnit() }
+        else if legacyUsesAudioEngine {
+            audioEngine.inputNode.removeTap(onBus: 0)
+            audioEngine.stop()
+        } else { AudioRecorder.shared.stop() }
+        legacyMicrophoneStarted = false
+        legacyAECStarted = false
+        legacyUsesAudioEngine = false
     }
     
     static func showPreview(path: String, image: NSImage? = nil) {
@@ -683,20 +714,7 @@ class SCContext {
     }
     
     static func adjustTime(sample: CMSampleBuffer, by offset: CMTime) -> CMSampleBuffer? {
-        guard CMSampleBufferGetFormatDescription(sample) != nil else { return nil }
-        
-        var timingInfo = [CMSampleTimingInfo](repeating: CMSampleTimingInfo(), count: Int(CMSampleBufferGetNumSamples(sample)))
-        CMSampleBufferGetSampleTimingInfoArray(sample, entryCount: timingInfo.count, arrayToFill: &timingInfo, entriesNeededOut: nil)
-        
-        for i in 0..<timingInfo.count {
-            timingInfo[i].decodeTimeStamp = CMTimeSubtract(timingInfo[i].decodeTimeStamp, offset)
-            timingInfo[i].presentationTimeStamp = CMTimeSubtract(timingInfo[i].presentationTimeStamp, offset)
-        }
-        
-        var outSampleBuffer: CMSampleBuffer?
-        CMSampleBufferCreateCopyWithNewTiming(allocator: nil, sampleBuffer: sample, sampleTimingEntryCount: timingInfo.count, sampleTimingArray: &timingInfo, sampleBufferOut: &outSampleBuffer)
-        
-        return outSampleBuffer
+        RecordingTimeline.adjusting(sample, by: offset)
     }
     
     static func showNotification(title: String, body: String, id: String) {

@@ -132,15 +132,19 @@ extension AppDelegate {
         }
         if SCContext.streamType == .systemaudio {
             SCContext.filter = SCContentFilter(display: screen, excludingApplications: [], exceptingWindows: [])
-            prepareAudioRecording()
         }
         Task { await record(filter: SCContext.filter!, fastStart: fastStart) }
     }
 
     func record(filter: SCContentFilter, fastStart: Bool = true) async {
-        SCContext.timeOffset = CMTimeMake(value: 0, timescale: 0)
+        SCContext.timeOffset = .zero
+        SCContext.timeline = RecordingTimeline()
         SCContext.isPaused = false
-        SCContext.isResume = false
+        SCContext.startTime = nil
+        SCContext.lastPTS = nil
+        SCContext.recordedMicrophone = recordMic
+        SCContext.microphoneSampleCount = 0
+        frameQueue = FixedLengthArray<CMTime>(maxLength: 20)
         
         let audioOnly = SCContext.streamType == .systemaudio
         
@@ -218,6 +222,25 @@ extension AppDelegate {
             conf.sampleRate = 48000
             conf.channelCount = 2
         }
+        SCContext.usesScreenCaptureKitMicrophone = false
+#if compiler(>=6.0)
+        if #available(macOS 15.0, *), recordMic && useScreenCaptureKitMicrophone {
+            conf.captureMicrophone = true
+            if micDevice != "default" {
+                guard let microphone = SCContext.getCurrentMic() else {
+                    SCContext.streamType = nil
+                    SCContext.showNotification(title: "Failed to Record".local,
+                        body: "Selected microphone is unavailable.".local, id: "quickrecorder.microphone.error")
+                    return
+                }
+                conf.microphoneCaptureDeviceID = microphone.uniqueID
+            }
+            SCContext.usesScreenCaptureKitMicrophone = true
+        }
+#endif
+        if recordMic {
+            print("Microphone capture: \(SCContext.usesScreenCaptureKitMicrophone ? "ScreenCaptureKit (no VPIO/AEC)" : "Legacy")")
+        }
         
 
         //  conf.minimumFrameInterval = CMTime(value: 1, timescale: audioOnly ? CMTimeScale.max : CMTimeScale(frameRate))
@@ -284,17 +307,27 @@ extension AppDelegate {
         
         SCContext.stream = SCStream(filter: filter, configuration: conf, delegate: self)
         do {
-            try SCContext.stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: .global())
-            if #available(macOS 13, *) { try SCContext.stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: .global()) }
+            try SCContext.stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: SCContext.recordingQueue)
+            if #available(macOS 13, *) { try SCContext.stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: SCContext.recordingQueue) }
+#if compiler(>=6.0)
+            if #available(macOS 15.0, *), SCContext.usesScreenCaptureKitMicrophone {
+                try SCContext.stream.addStreamOutput(self, type: .microphone, sampleHandlerQueue: SCContext.recordingQueue)
+            }
+#endif
             if !audioOnly {
                 initVideo(conf: conf)
-            } else {
-                //SCContext.startTime = Date.now
-                if recordMic { startMicRecording() }
-            }
+            } else { prepareAudioRecording() }
+            if recordMic && !SCContext.usesScreenCaptureKitMicrophone { try startMicRecording() }
             try await SCContext.stream.startCapture()
         } catch {
-            assertionFailure("capture failed".local)
+            SCContext.recordingQueue.sync { SCContext.stream = nil }
+            SCContext.stopMicrophoneRecording()
+            SCContext.usesScreenCaptureKitMicrophone = false
+            SCContext.vW?.cancelWriting()
+            SCContext.audioFile = nil
+            SCContext.streamType = nil
+            SCContext.showNotification(title: "Failed to Record".local,
+                body: error.localizedDescription, id: "quickrecorder.capture.error")
             return
         }
         if !audioOnly { registerGlobalMouseMonitor() }
@@ -430,12 +463,15 @@ extension AppDelegate {
             SCContext.micInput = AVAssetWriterInput(mediaType: AVMediaType.audio, outputSettings: settings)
             SCContext.micInput.expectsMediaDataInRealTime = true
             if SCContext.vW.canAdd(SCContext.micInput) { SCContext.vW.add(SCContext.micInput) }
-            startMicRecording()
         }
         SCContext.vW.startWriting()
     }
     
-    func startMicRecording() {
+    func startMicRecording() throws {
+        guard let activeStream = SCContext.stream else { return }
+        SCContext.legacyMicrophoneStarted = true
+        SCContext.legacyAECStarted = micDevice == "default" && enableAEC
+        SCContext.legacyUsesAudioEngine = micDevice == "default"
         if micDevice == "default" {
             if enableAEC {
                 var level = AUVoiceIOOtherAudioDuckingLevel.mid
@@ -444,26 +480,43 @@ extension AppDelegate {
                     case "max": level = .max
                     default: level = .mid
                 }
-                try? SCContext.AECEngine.startAudioStream(enableAEC: enableAEC, duckingLevel: level, audioBufferHandler: { pcmBuffer in
-                    if SCContext.isPaused || SCContext.startTime == nil { return }
-                    if SCContext.micInput.isReadyForMoreMediaData {
-                        SCContext.micInput.append(pcmBuffer.asSampleBuffer!)
-                    }
+                try SCContext.AECEngine.startAudioStream(enableAEC: enableAEC, duckingLevel: level, audioBufferHandler: { pcmBuffer in
+                    guard let sample = pcmBuffer.asSampleBuffer else { return }
+                    self.appendMicrophoneSample(sample, from: activeStream)
                 })
             } else {
                 let input = SCContext.audioEngine.inputNode
                 let inputFormat = input.inputFormat(forBus: 0)
                 input.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { buffer, time in
-                    if SCContext.isPaused || SCContext.startTime == nil { return }
-                    if SCContext.micInput.isReadyForMoreMediaData {
-                        SCContext.micInput.append(buffer.asSampleBuffer!)
-                    }
+                    guard let sample = buffer.asSampleBuffer else { return }
+                    self.appendMicrophoneSample(sample, from: activeStream)
                 }
-                try! SCContext.audioEngine.start()
+                try SCContext.audioEngine.start()
             }
         } else {
-            AudioRecorder.shared.setupAudioCapture()
+            AudioRecorder.shared.setupAudioCapture(stream: activeStream)
             AudioRecorder.shared.start()
+        }
+    }
+
+    func appendMicrophoneSample(_ sample: CMSampleBuffer, from activeStream: SCStream) {
+        // Retain the owning stream so late buffers cannot reach the next recording.
+        SCContext.recordingQueue.async {
+            guard SCContext.stream === activeStream else { return }
+            self.writeMicrophoneSample(sample)
+        }
+    }
+
+    private func writeMicrophoneSample(_ sample: CMSampleBuffer) {
+        guard SCContext.timeline.presentationTime(for: sample.presentationTimeStamp) != nil,
+              let input = SCContext.micInput, input.isReadyForMoreMediaData else { return }
+        let adjusted = SCContext.timeOffset.value > 0
+            ? SCContext.adjustTime(sample: sample, by: SCContext.timeOffset) : sample
+        guard let adjusted = adjusted, input.append(adjusted) else { return }
+        SCContext.microphoneSampleCount += 1
+        if SCContext.microphoneSampleCount == 1,
+           let format = sample.formatDescription?.audioStreamBasicDescription {
+            print("Microphone writing started: \(format.mSampleRate) Hz, \(format.mChannelsPerFrame) channel(s)")
         }
     }
     
@@ -487,6 +540,7 @@ extension AppDelegate {
     }
     
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of outputType: SCStreamOutputType) {
+        guard SCContext.stream === stream else { return }
         if SCContext.saveFrame, let imageBuffer = sampleBuffer.imageBuffer {
             SCContext.saveFrame = false
             
@@ -544,18 +598,6 @@ extension AppDelegate {
         if SCContext.isPaused { return }
         guard sampleBuffer.isValid else { return }
         var SampleBuffer = sampleBuffer
-        if SCContext.isResume {
-            SCContext.isResume = false
-            var pts = CMSampleBufferGetPresentationTimeStamp(SampleBuffer)
-            guard let last = SCContext.lastPTS else { return }
-            if last.flags.contains(CMTimeFlags.valid) {
-                if SCContext.timeOffset.flags.contains(CMTimeFlags.valid) { pts = CMTimeSubtract(pts, SCContext.timeOffset) }
-                let off = CMTimeSubtract(pts, last)
-                print("adding \(CMTimeGetSeconds(off)) to \(CMTimeGetSeconds(SCContext.timeOffset)) (pts \(CMTimeGetSeconds(SCContext.timeOffset)))")
-                if SCContext.timeOffset.value == 0 { SCContext.timeOffset = off } else { SCContext.timeOffset = CMTimeAdd(SCContext.timeOffset, off) }
-            }
-            SCContext.lastPTS?.flags = []
-        }
         switch outputType {
         case .screen:
             if (SCContext.screen == nil && SCContext.window == nil && SCContext.application == nil) || SCContext.streamType == .systemaudio { break }
@@ -565,11 +607,16 @@ extension AppDelegate {
                   let status = SCFrameStatus(rawValue: statusRawValue),
                   status == .complete else { return }
             
-            if SCContext.vW != nil && SCContext.vW?.status == .writing, SCContext.startTime == nil {
+            if SCContext.vW != nil && SCContext.vW?.status == .writing,
+               SCContext.timeline.begin(at: SampleBuffer.presentationTimeStamp) {
                 SCContext.startTime = Date.now
-                SCContext.vW.startSession(atSourceTime: CMSampleBufferGetPresentationTimeStamp(SampleBuffer))
+                SCContext.vW.startSession(atSourceTime: SCContext.timeline.sessionStart!)
             }
-            if (SCContext.timeOffset.value > 0) { SampleBuffer = SCContext.adjustTime(sample: SampleBuffer, by: SCContext.timeOffset) ?? sampleBuffer }
+            guard SCContext.timeline.presentationTime(for: SampleBuffer.presentationTimeStamp) != nil else { return }
+            if SCContext.timeOffset.value > 0 {
+                guard let adjusted = SCContext.adjustTime(sample: SampleBuffer, by: SCContext.timeOffset) else { return }
+                SampleBuffer = adjusted
+            }
             var pts = CMSampleBufferGetPresentationTimeStamp(SampleBuffer)
             let dur = CMSampleBufferGetDuration(SampleBuffer)
             if (dur.value > 0) { pts = CMTimeAdd(pts, dur) }
@@ -601,20 +648,28 @@ extension AppDelegate {
         case .audio:
             if SCContext.streamType == .systemaudio { // write directly to file if not video recording
                 hideMousePointer = true
-                if SCContext.vW != nil && SCContext.vW?.status == .writing, SCContext.startTime == nil {
-                    SCContext.vW.startSession(atSourceTime: CMSampleBufferGetPresentationTimeStamp(SampleBuffer))
+                if SCContext.timeline.begin(at: SampleBuffer.presentationTimeStamp) {
+                    if SCContext.vW?.status == .writing {
+                        SCContext.vW.startSession(atSourceTime: SCContext.timeline.sessionStart!)
+                    }
+                    SCContext.startTime = Date.now
                 }
-                if SCContext.startTime == nil { SCContext.startTime = Date.now }
+                guard SCContext.timeline.presentationTime(for: SampleBuffer.presentationTimeStamp) != nil else { return }
                 guard let samples = SampleBuffer.asPCMBuffer else { return }
                 do { try SCContext.audioFile?.write(from: samples) }
                 catch { assertionFailure("audio file writing issue".local) }
             } else {
-                if SCContext.lastPTS == nil { return }
+                guard SCContext.timeline.presentationTime(for: SampleBuffer.presentationTimeStamp) != nil else { return }
+                if SCContext.timeOffset.value > 0 {
+                    guard let adjusted = SCContext.adjustTime(sample: SampleBuffer, by: SCContext.timeOffset) else { return }
+                    SampleBuffer = adjusted
+                }
                 if SCContext.awInput.isReadyForMoreMediaData { SCContext.awInput.append(SampleBuffer) }
             }
 #if compiler(>=6.0)
         case .microphone:
-            break
+            guard SCContext.usesScreenCaptureKitMicrophone else { return }
+            writeMicrophoneSample(SampleBuffer)
 #endif
         @unknown default:
             assertionFailure("unknown stream type".local)
@@ -625,7 +680,7 @@ extension AppDelegate {
         print("closing stream with error:\n".local, error,
               "\nthis might be due to the window closing or the user stopping from the sonoma ui".local)
         DispatchQueue.main.async {
-            SCContext.stream = nil
+            guard SCContext.stream === stream else { return }
             SCContext.stopRecording()
         }
     }
@@ -636,8 +691,10 @@ class AudioRecorder: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
     private var captureSession: AVCaptureSession!
     private var audioInput: AVCaptureDeviceInput!
     private var audioDataOutput: AVCaptureAudioDataOutput!
+    private var owningStream: SCStream?
 
-    func setupAudioCapture() {
+    func setupAudioCapture(stream: SCStream) {
+        owningStream = stream
         captureSession = AVCaptureSession()
 
         // Get the default audio device (microphone)
@@ -689,10 +746,8 @@ class AudioRecorder: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
     }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        if SCContext.isPaused || SCContext.startTime == nil { return }
-        if SCContext.micInput.isReadyForMoreMediaData {
-            SCContext.micInput.append(sampleBuffer)
-        }
+        guard output === audioDataOutput, let owningStream = owningStream else { return }
+        AppDelegate.shared.appendMicrophoneSample(sampleBuffer, from: owningStream)
     }
 }
 

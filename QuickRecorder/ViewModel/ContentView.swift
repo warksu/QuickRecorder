@@ -19,6 +19,7 @@ struct ContentView: View {
     @State private var isPopoverShowing2 = false
     @State private var micList = SCContext.getMicrophone()
     @AppStorage("enableAEC") private var enableAEC: Bool = false
+    @AppStorage("useScreenCaptureKitMicrophone") private var useScreenCaptureKitMicrophone: Bool = supportsScreenCaptureKitMicrophone
     @AppStorage("recordMic") private var recordMic: Bool = false
     @AppStorage("micDevice") private var micDevice: String = "default"
     @AppStorage("showOnDock") private var showOnDock: Bool = true
@@ -78,7 +79,7 @@ struct ContentView: View {
                                     .onChange(of: recordMic) { _ in  Task { await SCContext.performMicCheck() }}
                                     .onAppear{ if micList.isEmpty { recordMic = false } }
                                     .disabled(micList.isEmpty)
-                                    if micDevice != "default" && enableAEC && recordMic{
+                                    if micDevice != "default" && enableAEC && recordMic && !(supportsScreenCaptureKitMicrophone && useScreenCaptureKitMicrophone) {
                                         Button {
                                             let alert = createAlert(
                                                 title: "Compatibility Warning".local,

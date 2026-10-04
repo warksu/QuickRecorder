@@ -215,6 +215,7 @@ struct OptionsView: View {
     @AppStorage("recordHDR")      private var recordHDR: Bool = false
     @AppStorage("micDevice")      private var micDevice: String = "default"
     @AppStorage("enableAEC")      private var enableAEC: Bool = false
+    @AppStorage("useScreenCaptureKitMicrophone") private var useScreenCaptureKitMicrophone: Bool = supportsScreenCaptureKitMicrophone
     
     var body: some View {
         VStack(spacing: 6) {
@@ -344,7 +345,7 @@ struct OptionsView: View {
                             if !list.contains(micDevice) { micDevice = "default" }
                         }
                         Spacer().frame(width: 5)
-                        if micDevice != "default" && enableAEC{
+                        if micDevice != "default" && enableAEC && !(supportsScreenCaptureKitMicrophone && useScreenCaptureKitMicrophone) {
                             Button("⚠️", action: {
                                 let alert = createAlert(
                                     title: "Compatibility Warning".local,

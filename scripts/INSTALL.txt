@@ -1,0 +1,17 @@
+QuickRecorder Audio Experiment (Apple Silicon)
+
+Drag QuickRecorder-AudioExperiment.app into Applications. It uses a separate
+app name and bundle ID, so the original QuickRecorder can stay installed.
+Quit the original app before running this build to avoid competing capture
+sessions. Grant screen recording and microphone access when macOS asks, then
+restart the app after changing screen recording permission.
+
+On macOS 15 or later, choose the ScreenCaptureKit microphone mode in Settings
+> Output to compare it with the legacy mode. This mode does not provide app-side
+acoustic echo cancellation. When using built-in speakers, check both recording
+levels and whether other meeting participants hear an echo. On older macOS
+versions, use the legacy microphone mode.
+
+This build is ad hoc signed and is not notarized. If macOS blocks its first
+launch, confirm the app's identity in System Settings > Privacy & Security and
+use the system's Open Anyway option. Do not replace the original app.

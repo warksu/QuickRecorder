@@ -222,6 +222,10 @@
 "loaded unknown audio format: " = "加载了未知的音频格式: ";
 "loaded unknown video format" = "加载了未知的视频格式";
 "unknown stream type" = "未知的流类型";
+"Microphone Capture" = "麥克風擷取方式";
+"Legacy" = "傳統方式";
+"ScreenCaptureKit does not apply echo cancellation. Legacy AEC requires the default microphone." = "ScreenCaptureKit 不進行迴音消除；傳統方式的 AEC 僅支援系統預設麥克風。";
+"Selected microphone is unavailable." = "所選麥克風無法使用。";
 "audio file writing issue" = "音频文件写入出错";
 "closing stream with error:\n" = "关闭流时发生错误:\n";
 "\nthis might be due to the window closing or the user stopping from the sonoma ui" = "\n这可能是有由于用户关闭了正在录制中的窗口, 或使用窗口上的附加按钮停止了录制.";
